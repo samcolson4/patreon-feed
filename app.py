@@ -30,6 +30,29 @@ POSTS_PER_CREATOR = int(os.environ.get("POSTS_PER_CREATOR", "40"))
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 PORT = int(os.environ.get("PORT", "8000"))
 CACHE_PATH = os.path.join(DATA_DIR, "cache.json")
+COOKIE_PATH = os.path.join(DATA_DIR, "session_id")
+
+
+def load_saved_cookie():
+    """A cookie pasted into the web page wins over the one in .env."""
+    global SESSION_ID
+    try:
+        with open(COOKIE_PATH) as f:
+            SESSION_ID = f.read().strip() or SESSION_ID
+    except OSError:
+        pass
+
+
+def save_cookie(value):
+    global SESSION_ID
+    value = value.strip().strip('"')
+    if value.startswith("session_id="):
+        value = value[len("session_id="):].split(";")[0]
+    SESSION_ID = value
+    os.makedirs(DATA_DIR, exist_ok=True)
+    fd = os.open(COOKIE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(value)
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 API = "https://www.patreon.com/api"
@@ -170,11 +193,14 @@ def render():
             f'<div class="s">{e(c.get("name", p["creator"]))} · <time title="{e(p["published"] or "")}">{ago(p["published"])}</time></div></div></a>')
     chips = "".join(f'<button class="chip" data-c="{e(v)}">{e(c["name"])}</button>' for v, c in s["creators"].items())
     if s["authed"] is False:
-        notice = '<p class="warn">Patreon session cookie was rejected — locked posts will stay locked. Update PATREON_SESSION_ID.</p>'
+        pill, msg = "bad", "Cookie rejected — locked posts will stay locked. Paste a fresh one."
     elif s["authed"] is None:
-        notice = '<p class="warn">No Patreon session set, so only public posts are visible.</p>'
+        pill, msg = "bad", "No Patreon cookie set, so only public posts are visible."
     else:
-        notice = ""
+        pill, msg = "ok", ""
+    label = f"Signed in as {e(s['authed'])}" if s["authed"] not in (None, False, True) else \
+        "Signed in" if s["authed"] else "Cookie rejected" if s["authed"] is False else "Not signed in"
+    notice = COOKIE_FORM.format(pill=pill, label=label, msg=e(msg), open="" if pill == "ok" else " open")
     errs = "".join(f'<p class="warn">{e(x)}</p>' for x in s["errors"])
     if not CREATORS:
         errs += '<p class="warn">No creators configured — set CREATORS in .env.</p>'
@@ -182,6 +208,13 @@ def render():
         errs += '<p class="warn">Fetching posts… refresh in a few seconds.</p>'
     return PAGE.format(cards="".join(cards), chips=chips, notice=notice + errs,
                        updated=e(ago(s["updated"]) if s["updated"] else "never"))
+
+
+COOKIE_FORM = """<details class="auth"{open}><summary class="pill {pill}">{label}</summary>
+<form method="post" action="/cookie"><p>{msg}</p>
+<p>Copy the <code>session_id</code> cookie from patreon.com (Dev Tools → Application → Cookies → www.patreon.com) and paste it here.</p>
+<input name="session_id" type="password" autocomplete="off" placeholder="session_id value" required>
+<button type="submit">Save &amp; check</button></form></details>"""
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -198,6 +231,11 @@ main{{padding:16px;display:grid;gap:16px;grid-template-columns:repeat(auto-fill,
 .card:hover{{border-color:var(--mut)}}.card.seen{{opacity:.45}}.thumb{{position:relative;aspect-ratio:16/9;background:var(--line)}}
 .thumb img{{width:100%;height:100%;object-fit:cover;display:block}}.b{{position:absolute;right:6px;bottom:6px;background:#000c;color:#fff;font-size:11px;padding:2px 6px;border-radius:4px}}
 .b.yt{{background:var(--acc)}}.meta{{padding:8px 10px 10px}}.t{{font-weight:600}}.s{{color:var(--mut);font-size:12px;margin-top:2px}}
+.auth{{margin:8px 16px 0}}.auth summary{{cursor:pointer;display:inline-block;list-style:none}}.auth summary::-webkit-details-marker{{display:none}}
+.pill{{border-radius:99px;padding:3px 10px;font-size:12px;font-weight:600}}.pill.ok{{background:#1a7f3722;color:#1a7f37}}.pill.bad{{background:#cf222e22;color:#cf222e}}
+.auth form{{margin-top:8px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--card);max-width:560px}}.auth p{{margin:0 0 8px}}.auth p:empty{{display:none}}
+.auth input{{width:100%;padding:6px 8px;font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;margin-bottom:8px}}
+.auth button{{font:inherit;padding:5px 12px;border-radius:6px;border:1px solid var(--line);background:var(--fg);color:var(--bg);cursor:pointer}}
 .warn{{margin:8px 16px 0;padding:8px 12px;border-radius:6px;background:#f5a62322;border:1px solid #f5a62366}}.hide{{display:none}}
 </style></head><body>
 <header><h1>Patreon Feed</h1><button class="chip on" data-c="">All</button>{chips}
@@ -234,7 +272,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        if self.path == "/refresh":
+        if self.path == "/cookie":
+            length = int(self.headers.get("Content-Length") or 0)
+            form = urllib.parse.parse_qs(self.rfile.read(length).decode())
+            save_cookie(form.get("session_id", [""])[0])
+            authed = check_auth()
+            with lock:
+                state["authed"] = authed
+            if authed:
+                threading.Thread(target=refresh, daemon=True).start()
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+        elif self.path == "/refresh":
             threading.Thread(target=refresh, daemon=True).start()
             self.send_response(303)
             self.send_header("Location", "/")
@@ -252,6 +302,7 @@ if __name__ == "__main__":
             state.update(json.load(f))
     except (OSError, ValueError):
         pass
+    load_saved_cookie()
     threading.Thread(target=refresher, daemon=True).start()
     print(f"listening on :{PORT} for {', '.join(CREATORS) or 'no creators'}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

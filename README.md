@@ -10,7 +10,8 @@ docker compose up -d --build
 Open http://localhost:8097.
 
 - **CREATORS**: comma-separated creator names (`patreon.com/<name>`) or full URLs.
-- **PATREON_SESSION_ID**: your `session_id` cookie from patreon.com (dev tools → Application → Cookies). Without it, only public posts show. It lasts for months; if it expires, the page shows a warning.
+- **PATREON_SESSION_ID** (optional): your `session_id` cookie from patreon.com (dev tools → Application → Cookies). Without it, only public posts show.
+- **Cookie status** is the pill under the header: green when signed in, red when missing or rejected. Click it to paste a new cookie; it's checked straight away and saved in the data volume, taking priority over `.env`.
 - Posts refresh every `REFRESH_MINUTES` (default 30) and are cached in the `patreon-feed-data` volume.
 - Clicked posts are dimmed (stored in your browser); right-click a dimmed post to unmark it.
 
