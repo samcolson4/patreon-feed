@@ -23,10 +23,29 @@ def env_secret(name):
     return os.environ.get(name, "").strip()
 
 
-CREATORS = [c.strip().strip("/").rsplit("/", 1)[-1] for c in os.environ.get("CREATORS", "").split(",") if c.strip()]
+def parse_feeds(raw):
+    """Each entry is a creator name, a creator URL or a collection URL, optionally
+    prefixed with "Label=". Entries are separated by commas or newlines."""
+    feeds = []
+    for entry in re.split(r"[,\n]", raw):
+        entry = entry.strip()
+        if not entry:
+            continue
+        m = re.match(r"^([^=/:]+?)\s*=\s*(\S.*)$", entry)
+        label, target = (m.group(1).strip(), m.group(2).strip()) if m else (None, entry)
+        col = re.search(r"collection/(\d+)", target)
+        if col:
+            feeds.append({"key": "col:" + col.group(1), "collection": col.group(1), "label": label})
+        else:
+            vanity = target.split("?")[0].strip("/").rsplit("/", 1)[-1]
+            feeds.append({"key": "c:" + vanity, "vanity": vanity, "label": label})
+    return feeds
+
+
+FEEDS = parse_feeds(os.environ.get("FEEDS") or os.environ.get("CREATORS", ""))
 SESSION_ID = env_secret("PATREON_SESSION_ID")
 REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", "30"))
-POSTS_PER_CREATOR = int(os.environ.get("POSTS_PER_CREATOR", "40"))
+POSTS_PER_FEED = int(os.environ.get("POSTS_PER_FEED") or os.environ.get("POSTS_PER_CREATOR") or "40")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 PORT = int(os.environ.get("PORT", "8000"))
 CACHE_PATH = os.path.join(DATA_DIR, "cache.json")
@@ -58,7 +77,7 @@ UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML,
 API = "https://www.patreon.com/api"
 YT_RE = re.compile(r"(?:youtube\.com/(?:watch\?(?:[^\"'\s<>]*&)?v=|embed/|shorts/|live/)|youtu\.be/)([A-Za-z0-9_-]{11})")
 
-state = {"posts": [], "creators": {}, "updated": None, "errors": [], "authed": None}
+state = {"posts": [], "feeds": {}, "updated": None, "errors": [], "authed": None}
 lock = threading.Lock()
 
 
@@ -71,14 +90,21 @@ def api_get(url):
         return json.load(r)
 
 
-def lookup_campaign(vanity):
-    q = urllib.parse.urlencode({"filter[vanity]": vanity, "fields[campaign]": "name,url,avatar_photo_url"})
-    data = api_get(f"{API}/campaigns?{q}")["data"]
-    if not data:
-        raise ValueError(f"no Patreon creator called '{vanity}'")
-    c = data[0]
-    return {"id": c["id"], "vanity": vanity, "name": c["attributes"]["name"],
-            "url": c["attributes"]["url"], "avatar": c["attributes"].get("avatar_photo_url")}
+def resolve(feed):
+    """Look up the campaign (and collection title) behind a configured feed."""
+    if "collection" in feed:
+        q = urllib.parse.urlencode({"include": "campaign", "fields[collection]": "title",
+                                    "fields[campaign]": "name,url"})
+        r = api_get(f"{API}/collection/{feed['collection']}?{q}")
+        campaign_id = r["data"]["relationships"]["campaign"]["data"]["id"]
+        name = r["data"]["attributes"]["title"]
+    else:
+        q = urllib.parse.urlencode({"filter[vanity]": feed["vanity"], "fields[campaign]": "name,url"})
+        data = api_get(f"{API}/campaigns?{q}")["data"]
+        if not data:
+            raise ValueError(f"no Patreon creator called '{feed['vanity']}'")
+        campaign_id, name = data[0]["id"], data[0]["attributes"]["name"]
+    return dict(feed, campaign_id=campaign_id, name=feed["label"] or name.strip())
 
 
 def youtube_id(attrs):
@@ -90,24 +116,26 @@ def youtube_id(attrs):
     return None
 
 
-def fetch_posts(campaign):
-    q = urllib.parse.urlencode({
-        "filter[campaign_id]": campaign["id"],
+def fetch_posts(feed):
+    params = {
+        "filter[campaign_id]": feed["campaign_id"],
         "filter[contains_exclusive_posts]": "true",
         "sort": "-published_at",
         "page[size]": "20",
         "fields[post]": "title,published_at,url,embed,image,post_type,current_user_can_view,content,teaser_text",
         "json-api-version": "1.0",
-    })
-    url, posts = f"{API}/posts?{q}", []
-    while url and len(posts) < POSTS_PER_CREATOR:
+    }
+    if "collection" in feed:
+        params["filter[collection_id]"] = feed["collection"]
+    url, posts = f"{API}/posts?{urllib.parse.urlencode(params)}", []
+    while url and len(posts) < POSTS_PER_FEED:
         page = api_get(url)
         for p in page["data"]:
             a = p["attributes"]
             yt = youtube_id(a)
             posts.append({
                 "id": p["id"],
-                "creator": campaign["vanity"],
+                "feed": feed["key"],
                 "title": (a.get("title") or "").strip() or "(untitled)",
                 "published": a.get("published_at"),
                 "patreon_url": a.get("url"),
@@ -117,7 +145,7 @@ def fetch_posts(campaign):
                 "type": a.get("post_type"),
             })
         url = (page.get("links") or {}).get("next")
-    return posts[:POSTS_PER_CREATOR]
+    return posts[:POSTS_PER_FEED]
 
 
 def check_auth():
@@ -131,20 +159,22 @@ def check_auth():
 
 
 def refresh():
-    creators, posts, errors = {}, [], []
+    feeds, posts, errors = {}, [], []
     with lock:
-        known = dict(state["creators"])
-    for vanity in CREATORS:
+        known = dict(state["feeds"])
+    for feed in FEEDS:
         try:
-            c = known.get(vanity) or lookup_campaign(vanity)
-            creators[vanity] = c
-            posts.extend(fetch_posts(c))
+            f = known.get(feed["key"])
+            if not f or f.get("label") != feed["label"]:
+                f = resolve(feed)
+            feeds[feed["key"]] = f
+            posts.extend(fetch_posts(f))
         except Exception as e:
-            errors.append(f"{vanity}: {e}")
+            errors.append(f"{feed['label'] or feed['key']}: {e}")
     authed = check_auth()
     posts.sort(key=lambda p: p["published"] or "", reverse=True)
     with lock:
-        state.update(posts=posts, creators=creators, errors=errors, authed=authed,
+        state.update(posts=posts, feeds=feeds, errors=errors, authed=authed,
                      updated=datetime.now(timezone.utc).isoformat())
         snapshot = dict(state)
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -179,7 +209,7 @@ def render():
     e = html.escape
     cards = []
     for p in s["posts"]:
-        c = s["creators"].get(p["creator"], {})
+        f = s["feeds"].get(p.get("feed", ""), {})
         href = f"https://www.youtube.com/watch?v={p['youtube_id']}" if p["youtube_id"] else p["patreon_url"]
         badge = ('<span class="b yt">YouTube</span>' if p["youtube_id"]
                  else '<span class="b lock">Locked</span>' if p["locked"]
@@ -187,11 +217,11 @@ def render():
         img = f'<img loading="lazy" src="{e(p["image"])}" alt="">' if p["image"] else '<div class="noimg"></div>'
         cards.append(
             f'<a class="card" href="{e(href)}" target="_blank" rel="noopener" data-id="{e(p["id"])}" '
-            f'data-creator="{e(p["creator"])}" data-yt="{1 if p["youtube_id"] else 0}">'
+            f'data-feed="{e(p.get("feed", ""))}" data-yt="{1 if p["youtube_id"] else 0}">'
             f'<div class="thumb">{img}{badge}</div>'
             f'<div class="meta"><div class="t">{e(p["title"])}</div>'
-            f'<div class="s">{e(c.get("name", p["creator"]))} · <time title="{e(p["published"] or "")}">{ago(p["published"])}</time></div></div></a>')
-    chips = "".join(f'<button class="chip" data-c="{e(v)}">{e(c["name"])}</button>' for v, c in s["creators"].items())
+            f'<div class="s">{e(f.get("name", p.get("feed", "")))} · <time title="{e(p["published"] or "")}">{ago(p["published"])}</time></div></div></a>')
+    chips = "".join(f'<button class="chip" data-c="{e(k)}">{e(f["name"])}</button>' for k, f in s["feeds"].items())
     if s["authed"] is False:
         pill, msg = "bad", "Cookie rejected — locked posts will stay locked. Paste a fresh one."
     elif s["authed"] is None:
@@ -202,8 +232,8 @@ def render():
         "Signed in" if s["authed"] else "Cookie rejected" if s["authed"] is False else "Not signed in"
     notice = COOKIE_FORM.format(pill=pill, label=label, msg=e(msg), open="" if pill == "ok" else " open")
     errs = "".join(f'<p class="warn">{e(x)}</p>' for x in s["errors"])
-    if not CREATORS:
-        errs += '<p class="warn">No creators configured — set CREATORS in .env.</p>'
+    if not FEEDS:
+        errs += '<p class="warn">No feeds configured — set FEEDS in .env.</p>'
     elif s["updated"] is None:
         errs += '<p class="warn">Fetching posts… refresh in a few seconds.</p>'
     return PAGE.format(cards="".join(cards), chips=chips, notice=notice + errs,
@@ -243,10 +273,15 @@ main{{padding:16px;display:grid;gap:16px;grid-template-columns:repeat(auto-fill,
 <span class="upd">updated {updated}</span></header>{notice}<main>{cards}</main>
 <script>
 const K="seen",get=()=>{{try{{return new Set(JSON.parse(localStorage.getItem(K)||"[]"))}}catch(e){{return new Set()}}}};
-let seen=get(),creator="";const cards=[...document.querySelectorAll(".card")];
+const P="prefs",prefs=(()=>{{try{{return JSON.parse(localStorage.getItem(P))||{{}}}}catch(e){{return {{}}}}}})();
+let seen=get(),creator=prefs.feed||"";const cards=[...document.querySelectorAll(".card")];
+if(!document.querySelector(`header .chip[data-c="${{CSS.escape(creator)}}"]`))creator="";
+document.getElementById("yt").checked=prefs.yt!==false;document.getElementById("unseen").checked=!!prefs.unseen;
+document.querySelectorAll("header .chip").forEach(x=>x.classList.toggle("on",x.dataset.c===creator));
 function apply(){{const yt=document.getElementById("yt").checked,un=document.getElementById("unseen").checked;
+try{{localStorage.setItem(P,JSON.stringify({{feed:creator,yt,unseen:un}}))}}catch(e){{}}
 cards.forEach(c=>{{const s=seen.has(c.dataset.id);c.classList.toggle("seen",s);
-c.classList.toggle("hide",(creator&&c.dataset.creator!==creator)||(yt&&c.dataset.yt!=="1")||(un&&s))}})}}
+c.classList.toggle("hide",(creator&&c.dataset.feed!==creator)||(yt&&c.dataset.yt!=="1")||(un&&s))}})}}
 document.querySelectorAll("header .chip").forEach(b=>b.onclick=()=>{{creator=b.dataset.c;
 document.querySelectorAll("header .chip").forEach(x=>x.classList.toggle("on",x===b));apply()}});
 document.getElementById("yt").onchange=document.getElementById("unseen").onchange=apply;
@@ -304,5 +339,5 @@ if __name__ == "__main__":
         pass
     load_saved_cookie()
     threading.Thread(target=refresher, daemon=True).start()
-    print(f"listening on :{PORT} for {', '.join(CREATORS) or 'no creators'}", flush=True)
+    print(f"listening on :{PORT} for {len(FEEDS)} feeds", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
