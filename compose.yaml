@@ -1,0 +1,13 @@
+services:
+  patreon-feed:
+    build: .
+    container_name: patreon-feed
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8097:8000"
+    volumes:
+      - patreon-feed-data:/data
+
+volumes:
+  patreon-feed-data:

@@ -1,0 +1,257 @@
+"""Patreon feed: one fast page listing recent posts from a few creators,
+linking straight to YouTube wherever a post has a YouTube video.
+
+Stdlib only. Config comes from environment variables (see README).
+"""
+
+import html
+import json
+import os
+import re
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def env_secret(name):
+    path = os.environ.get(name + "_FILE")
+    if path and os.path.exists(path):
+        return open(path).read().strip()
+    return os.environ.get(name, "").strip()
+
+
+CREATORS = [c.strip().strip("/").rsplit("/", 1)[-1] for c in os.environ.get("CREATORS", "").split(",") if c.strip()]
+SESSION_ID = env_secret("PATREON_SESSION_ID")
+REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", "30"))
+POSTS_PER_CREATOR = int(os.environ.get("POSTS_PER_CREATOR", "40"))
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+PORT = int(os.environ.get("PORT", "8000"))
+CACHE_PATH = os.path.join(DATA_DIR, "cache.json")
+
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+API = "https://www.patreon.com/api"
+YT_RE = re.compile(r"(?:youtube\.com/(?:watch\?(?:[^\"'\s<>]*&)?v=|embed/|shorts/|live/)|youtu\.be/)([A-Za-z0-9_-]{11})")
+
+state = {"posts": [], "creators": {}, "updated": None, "errors": [], "authed": None}
+lock = threading.Lock()
+
+
+def api_get(url):
+    headers = {"User-Agent": UA, "Accept": "application/vnd.api+json"}
+    if SESSION_ID:
+        headers["Cookie"] = "session_id=" + SESSION_ID
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def lookup_campaign(vanity):
+    q = urllib.parse.urlencode({"filter[vanity]": vanity, "fields[campaign]": "name,url,avatar_photo_url"})
+    data = api_get(f"{API}/campaigns?{q}")["data"]
+    if not data:
+        raise ValueError(f"no Patreon creator called '{vanity}'")
+    c = data[0]
+    return {"id": c["id"], "vanity": vanity, "name": c["attributes"]["name"],
+            "url": c["attributes"]["url"], "avatar": c["attributes"].get("avatar_photo_url")}
+
+
+def youtube_id(attrs):
+    for text in ((attrs.get("embed") or {}).get("url"), (attrs.get("embed") or {}).get("html"), attrs.get("content")):
+        if text:
+            m = YT_RE.search(text)
+            if m:
+                return m.group(1)
+    return None
+
+
+def fetch_posts(campaign):
+    q = urllib.parse.urlencode({
+        "filter[campaign_id]": campaign["id"],
+        "filter[contains_exclusive_posts]": "true",
+        "sort": "-published_at",
+        "page[size]": "20",
+        "fields[post]": "title,published_at,url,embed,image,post_type,current_user_can_view,content,teaser_text",
+        "json-api-version": "1.0",
+    })
+    url, posts = f"{API}/posts?{q}", []
+    while url and len(posts) < POSTS_PER_CREATOR:
+        page = api_get(url)
+        for p in page["data"]:
+            a = p["attributes"]
+            yt = youtube_id(a)
+            posts.append({
+                "id": p["id"],
+                "creator": campaign["vanity"],
+                "title": (a.get("title") or "").strip() or "(untitled)",
+                "published": a.get("published_at"),
+                "patreon_url": a.get("url"),
+                "youtube_id": yt,
+                "image": f"https://i.ytimg.com/vi/{yt}/mqdefault.jpg" if yt else (a.get("image") or {}).get("url"),
+                "locked": not a.get("current_user_can_view"),
+                "type": a.get("post_type"),
+            })
+        url = (page.get("links") or {}).get("next")
+    return posts[:POSTS_PER_CREATOR]
+
+
+def check_auth():
+    if not SESSION_ID:
+        return None
+    try:
+        me = api_get(f"{API}/current_user?fields%5Buser%5D=full_name")
+        return me["data"]["attributes"].get("full_name") or True
+    except Exception:
+        return False
+
+
+def refresh():
+    creators, posts, errors = {}, [], []
+    with lock:
+        known = dict(state["creators"])
+    for vanity in CREATORS:
+        try:
+            c = known.get(vanity) or lookup_campaign(vanity)
+            creators[vanity] = c
+            posts.extend(fetch_posts(c))
+        except Exception as e:
+            errors.append(f"{vanity}: {e}")
+    authed = check_auth()
+    posts.sort(key=lambda p: p["published"] or "", reverse=True)
+    with lock:
+        state.update(posts=posts, creators=creators, errors=errors, authed=authed,
+                     updated=datetime.now(timezone.utc).isoformat())
+        snapshot = dict(state)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CACHE_PATH + ".tmp", "w") as f:
+        json.dump(snapshot, f)
+    os.replace(CACHE_PATH + ".tmp", CACHE_PATH)
+    print(f"refreshed: {len(posts)} posts, {len(errors)} errors", flush=True)
+
+
+def refresher():
+    while True:
+        try:
+            refresh()
+        except Exception as e:
+            print("refresh failed:", e, flush=True)
+        time.sleep(REFRESH_MINUTES * 60)
+
+
+def ago(iso):
+    if not iso:
+        return ""
+    secs = (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds()
+    for unit, n in (("y", 31536000), ("mo", 2592000), ("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= n:
+            return f"{int(secs // n)}{unit} ago"
+    return "just now"
+
+
+def render():
+    with lock:
+        s = dict(state)
+    e = html.escape
+    cards = []
+    for p in s["posts"]:
+        c = s["creators"].get(p["creator"], {})
+        href = f"https://www.youtube.com/watch?v={p['youtube_id']}" if p["youtube_id"] else p["patreon_url"]
+        badge = ('<span class="b yt">YouTube</span>' if p["youtube_id"]
+                 else '<span class="b lock">Locked</span>' if p["locked"]
+                 else '<span class="b">Patreon</span>')
+        img = f'<img loading="lazy" src="{e(p["image"])}" alt="">' if p["image"] else '<div class="noimg"></div>'
+        cards.append(
+            f'<a class="card" href="{e(href)}" target="_blank" rel="noopener" data-id="{e(p["id"])}" '
+            f'data-creator="{e(p["creator"])}" data-yt="{1 if p["youtube_id"] else 0}">'
+            f'<div class="thumb">{img}{badge}</div>'
+            f'<div class="meta"><div class="t">{e(p["title"])}</div>'
+            f'<div class="s">{e(c.get("name", p["creator"]))} · <time title="{e(p["published"] or "")}">{ago(p["published"])}</time></div></div></a>')
+    chips = "".join(f'<button class="chip" data-c="{e(v)}">{e(c["name"])}</button>' for v, c in s["creators"].items())
+    if s["authed"] is False:
+        notice = '<p class="warn">Patreon session cookie was rejected — locked posts will stay locked. Update PATREON_SESSION_ID.</p>'
+    elif s["authed"] is None:
+        notice = '<p class="warn">No Patreon session set, so only public posts are visible.</p>'
+    else:
+        notice = ""
+    errs = "".join(f'<p class="warn">{e(x)}</p>' for x in s["errors"])
+    if not CREATORS:
+        errs += '<p class="warn">No creators configured — set CREATORS in .env.</p>'
+    elif s["updated"] is None:
+        errs += '<p class="warn">Fetching posts… refresh in a few seconds.</p>'
+    return PAGE.format(cards="".join(cards), chips=chips, notice=notice + errs,
+                       updated=e(ago(s["updated"]) if s["updated"] else "never"))
+
+
+PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Patreon Feed</title>
+<style>
+:root{{--bg:#fafafa;--fg:#111;--mut:#666;--card:#fff;--line:#e5e5e5;--acc:#c00}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#0f0f0f;--fg:#eee;--mut:#999;--card:#1a1a1a;--line:#2a2a2a;--acc:#f33}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}}
+header{{position:sticky;top:0;z-index:1;background:var(--bg);border-bottom:1px solid var(--line);padding:12px 16px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}}
+h1{{font-size:16px;margin:0 12px 0 0}}.chip{{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:99px;padding:4px 12px;cursor:pointer;font:inherit}}
+.chip.on{{background:var(--fg);color:var(--bg)}}label{{color:var(--mut);display:flex;gap:4px;align-items:center}}.upd{{margin-left:auto;color:var(--mut);font-size:12px}}
+main{{padding:16px;display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}}
+.card{{color:inherit;text-decoration:none;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}}
+.card:hover{{border-color:var(--mut)}}.card.seen{{opacity:.45}}.thumb{{position:relative;aspect-ratio:16/9;background:var(--line)}}
+.thumb img{{width:100%;height:100%;object-fit:cover;display:block}}.b{{position:absolute;right:6px;bottom:6px;background:#000c;color:#fff;font-size:11px;padding:2px 6px;border-radius:4px}}
+.b.yt{{background:var(--acc)}}.meta{{padding:8px 10px 10px}}.t{{font-weight:600}}.s{{color:var(--mut);font-size:12px;margin-top:2px}}
+.warn{{margin:8px 16px 0;padding:8px 12px;border-radius:6px;background:#f5a62322;border:1px solid #f5a62366}}.hide{{display:none}}
+</style></head><body>
+<header><h1>Patreon Feed</h1><button class="chip on" data-c="">All</button>{chips}
+<label><input type="checkbox" id="yt"> YouTube only</label><label><input type="checkbox" id="unseen"> Hide watched</label>
+<span class="upd">updated {updated}</span></header>{notice}<main>{cards}</main>
+<script>
+const K="seen",get=()=>{{try{{return new Set(JSON.parse(localStorage.getItem(K)||"[]"))}}catch(e){{return new Set()}}}};
+let seen=get(),creator="";const cards=[...document.querySelectorAll(".card")];
+function apply(){{const yt=document.getElementById("yt").checked,un=document.getElementById("unseen").checked;
+cards.forEach(c=>{{const s=seen.has(c.dataset.id);c.classList.toggle("seen",s);
+c.classList.toggle("hide",(creator&&c.dataset.creator!==creator)||(yt&&c.dataset.yt!=="1")||(un&&s))}})}}
+document.querySelectorAll("header .chip").forEach(b=>b.onclick=()=>{{creator=b.dataset.c;
+document.querySelectorAll("header .chip").forEach(x=>x.classList.toggle("on",x===b));apply()}});
+document.getElementById("yt").onchange=document.getElementById("unseen").onchange=apply;
+cards.forEach(c=>{{c.addEventListener("click",()=>{{seen.add(c.dataset.id);try{{localStorage.setItem(K,JSON.stringify([...seen]))}}catch(e){{}}apply()}});
+c.addEventListener("contextmenu",ev=>{{if(seen.has(c.dataset.id)){{ev.preventDefault();seen.delete(c.dataset.id);try{{localStorage.setItem(K,JSON.stringify([...seen]))}}catch(e){{}}apply()}}}})}});
+apply();
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?")[0] == "/healthz":
+            body, ctype = b"ok", "text/plain"
+        elif self.path.split("?")[0] == "/":
+            body, ctype = render().encode(), "text/html; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path == "/refresh":
+            threading.Thread(target=refresh, daemon=True).start()
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+        else:
+            self.send_error(404)
+
+    def log_message(self, *args):
+        pass
+
+
+if __name__ == "__main__":
+    try:
+        with open(CACHE_PATH) as f:
+            state.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    threading.Thread(target=refresher, daemon=True).start()
+    print(f"listening on :{PORT} for {', '.join(CREATORS) or 'no creators'}", flush=True)
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
