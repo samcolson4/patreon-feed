@@ -1,6 +1,7 @@
 FROM python:3.13-alpine
 WORKDIR /app
 COPY app.py .
+COPY patreonfeed ./patreonfeed
 ENV DATA_DIR=/data PORT=8000 PYTHONUNBUFFERED=1
 RUN mkdir /data && chown nobody /data
 VOLUME /data

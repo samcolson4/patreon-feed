@@ -16,3 +16,19 @@ Open http://localhost:8097.
 - "YouTube only" is on by default and the filters are remembered per browser. Clicked posts are dimmed (stored in your browser); right-click a dimmed post to unmark it.
 
 This uses Patreon's internal web API, the same one patreon.com itself calls, so it could break if they change it.
+
+## Layout
+
+| File | Job |
+| --- | --- |
+| `app.py` | Entry point: loads the cache and saved cookie, starts refreshing, serves. |
+| `patreonfeed/config.py` | Environment variables and `FEEDS` parsing. |
+| `patreonfeed/session.py` | The Patreon cookie: from `.env`, or pasted in the page and saved to `/data`. |
+| `patreonfeed/patreon.py` | Talks to Patreon's API: sign-in check, feed lookup, posts, YouTube link detection. |
+| `patreonfeed/store.py` | Holds the posts, refreshes on a timer, caches to `/data/cache.json`. |
+| `patreonfeed/render.py` | Fills the HTML templates from the stored posts. |
+| `patreonfeed/web.py` | HTTP routes. |
+| `patreonfeed/templates/` | `page.html`, `card.html`, `auth.html`, using `$name` placeholders (Python's `string.Template`). |
+| `patreonfeed/static/` | `style.css` and `app.js` (filters and watched marks). |
+
+Templates and static files are read once at startup, so after editing them run `docker compose up -d --build`.

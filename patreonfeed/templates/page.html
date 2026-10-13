@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Patreon Feed</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Patreon Feed</h1>
+    <button class="chip on" data-c="">All</button>
+    $chips
+    <label><input type="checkbox" id="yt"> YouTube only</label>
+    <label><input type="checkbox" id="unseen"> Hide watched</label>
+    <span class="upd">updated $updated</span>
+  </header>
+  $auth
+  $warnings
+  <main>$cards</main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
