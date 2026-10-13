@@ -1,6 +1,9 @@
 # patreon-feed
+<img width="1273" height="656" alt="Screenshot 2026-10-13 at 05 45 02" src="https://github.com/user-attachments/assets/2f6c25cf-a887-4266-9184-0f3335f3fd48" />
 
 One fast local page listing recent posts from a few Patreon creators or collections. Any post with a YouTube video links straight to YouTube; everything else links to the Patreon post.
+
+This is a response to Patreon who have built the slowest website it is possible to build.
 
 ```bash
 cp .env.example .env   # set FEEDS
